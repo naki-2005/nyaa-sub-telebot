@@ -7,3 +7,4 @@ schedule
 cryptg
 tgcrypto
 python-dotenv
+beautifulsoup4
