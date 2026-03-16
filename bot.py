@@ -4,19 +4,17 @@ import argparse
 import threading
 import random
 import string
-import asyncio
-import shutil
-import tempfile
-import time
 import re
-import uuid
+import requests
+import libtorrent as lt
+import bencodepy
+import time
+import schedule
 from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from pyrogram.enums import ParseMode
 import nyaa
-import libtorrent as lt
-import datetime
 
 app = Flask(__name__)
 
@@ -28,100 +26,171 @@ def run_flask():
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
 search_cache = {}
-download_tasks = {}
-subs_cache = {}
+downloads = {}
+subscriptions = {}
+subscription_lock = threading.Lock()
 
 def generate_cache_id():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
 
-class TorrentDownloader:
+def format_size(size):
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size < 1024.0:
+            return f"{size:.2f} {unit}"
+        size /= 1024.0
+    return f"{size:.2f} PB"
+
+class DownloadHandler:
     def __init__(self):
-        self.active_downloads = {}
-        self.downloads_lock = threading.Lock()
+        self.session = lt.session()
+        self.session.listen_on(6881, 6891)
+        self.downloads = {}
+        
+    def add_magnet(self, magnet_link, save_path):
+        params = {
+            'save_path': save_path,
+            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
+            'paused': False,
+            'auto_managed': True,
+            'duplicate_is_error': True
+        }
+        
+        handle = lt.add_magnet_uri(self.session, magnet_link, params)
+        download_id = generate_cache_id()
+        
+        self.downloads[download_id] = {
+            'handle': handle,
+            'magnet': magnet_link,
+            'path': save_path,
+            'start_time': time.time(),
+            'status': 'downloading'
+        }
+        
+        return download_id
     
-    def start_session(self):
-        ses = lt.session()
-        ses.listen_on(6881, 6891)
-        ses.start_dht()
-        return ses
+    def add_torrent_file(self, torrent_data, save_path):
+        info = lt.torrent_info(torrent_data)
+        params = {
+            'save_path': save_path,
+            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
+            'paused': False,
+            'auto_managed': True,
+            'ti': info
+        }
+        
+        handle = self.session.add_torrent(params)
+        download_id = generate_cache_id()
+        
+        self.downloads[download_id] = {
+            'handle': handle,
+            'path': save_path,
+            'start_time': time.time(),
+            'status': 'downloading',
+            'name': info.name()
+        }
+        
+        return download_id
     
-    def add_torrent(self, ses, magnet_uri, save_path):
-        params = {'save_path': save_path, 'storage_mode': lt.storage_mode_t.storage_mode_sparse}
-        handle = lt.add_magnet_uri(ses, magnet_uri, params)
-        return handle
-    
-    async def wait_for_metadata(self, handle):
-        while not handle.has_metadata():
-            await asyncio.sleep(1)
-    
-    async def download_magnet(self, magnet_link, save_path="downloads"):
-        try:
-            ses = self.start_session()
-            handle = self.add_torrent(ses, magnet_link, save_path)
-            await self.wait_for_metadata(handle)
+    def get_status(self, download_id):
+        if download_id not in self.downloads:
+            return None
             
-            start_time = datetime.datetime.now()
-            last_update = 0
+        download = self.downloads[download_id]
+        handle = download['handle']
+        
+        if not handle.is_valid():
+            download['status'] = 'error'
+            return download
             
-            while handle.status().state != lt.torrent_status.seeding:
-                s = handle.status()
-                elapsed = datetime.datetime.now() - start_time
-                elapsed_str = str(elapsed).split('.')[0]
+        status = handle.status()
+        
+        download['status'] = 'downloading'
+        download['progress'] = status.progress * 100
+        download['download_rate'] = status.download_rate
+        download['upload_rate'] = status.upload_rate
+        download['total_download'] = status.total_download
+        download['total_upload'] = status.total_upload
+        download['num_peers'] = status.num_peers
+        download['num_seeds'] = status.num_seeds
+        download['state'] = str(status.state)
+        download['name'] = handle.torrent_file().name() if handle.has_metadata() else 'Obteniendo metadata...'
+        
+        if status.is_finished:
+            download['status'] = 'finished'
+            
+        return download
+    
+    def remove_download(self, download_id):
+        if download_id in self.downloads:
+            handle = self.downloads[download_id]['handle']
+            if handle.is_valid():
+                self.session.remove_torrent(handle)
+            del self.downloads[download_id]
+            return True
+        return False
+
+download_handler = DownloadHandler()
+
+def subscription_worker():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+def check_subscriptions():
+    with subscription_lock:
+        for sub_id, sub_data in list(subscriptions.items()):
+            try:
+                chat_id = sub_data['chat_id']
+                query = sub_data['query']
+                adult = sub_data['adult']
+                last_result = sub_data['last_result']
                 
-                if s.state == lt.torrent_status.downloading:
-                    progress = s.progress * 100
-                    download_rate = s.download_rate / 1000
-                    download_rate_mb = download_rate / 1024
-                    current_mb = s.total_done / (1024 * 1024)
-                    total_mb = s.total_wanted / (1024 * 1024)
-                    bar_length = 20
-                    filled_length = int(bar_length * progress / 100)
-                    bar = "█" * filled_length + "▒" * (bar_length - filled_length)
-                    torrent_name = handle.name() or "Descarga en curso"
+                nyaa_search = nyaa.Nyaa_search()
+                if adult:
+                    results = nyaa_search.nyaafap(query)
+                else:
+                    results = nyaa_search.nyaafun(query)
+                
+                if results and len(results) > 0:
+                    first_result = results[0]
                     
-                    if time.time() - last_update > 2:
-                        progress_msg = f"📥 Descargando: {torrent_name[:50]}...\n"
-                        progress_msg += f"📊 Progreso: {progress:.2f}%\n"
-                        progress_msg += f"📉 [{bar}]\n"
-                        progress_msg += f"📦 Tamaño: {current_mb:.2f} MB / {total_mb:.2f} MB\n"
-                        progress_msg += f"🚀 Velocidad: {download_rate_mb:.1f} MB/s\n"
-                        progress_msg += f"⏱️ Tiempo: {elapsed_str}"
-                        yield progress_msg
-                        last_update = time.time()
-                
-                await asyncio.sleep(1)
-            
-            elapsed = datetime.datetime.now() - start_time
-            elapsed_str = str(elapsed).split('.')[0]
-            torrent_name = handle.name() or "unnamed"
-            final_path = os.path.join(save_path, self.clean_name(torrent_name))
-            
-            if os.path.isfile(final_path):
-                yield ("file", final_path)
-            elif os.path.isdir(final_path):
-                yield ("folder", final_path)
-            else:
-                yield ("error", "No se encontró el archivo descargado")
-                
-        except Exception as e:
-            yield ("error", str(e))
-    
-    def clean_name(self, name):
-        if not name:
-            return "unnamed"
-        prohibited_chars = '<>:"/\\|?*'
-        cleaned = ''.join(c for c in name if c not in prohibited_chars)
-        cleaned = cleaned.strip()
-        while cleaned.endswith('.'):
-            cleaned = cleaned[:-1].strip()
-        if len(cleaned) > 248:
-            cleaned = cleaned[:248]
-        reserved_names = ['CON', 'PRN', 'AUX', 'NUL', 'COM1', 'COM2', 'COM3', 'COM4', 'COM5', 'COM6', 'COM7', 'COM8', 'COM9', 'LPT1', 'LPT2', 'LPT3', 'LPT4', 'LPT5', 'LPT6', 'LPT7', 'LPT8', 'LPT9']
-        if cleaned.upper() in reserved_names:
-            cleaned = '_' + cleaned
-        if not cleaned:
-            cleaned = "unnamed"
-        return cleaned
+                    if last_result is None or first_result['date'] != last_result['date']:
+                        sub_data['last_result'] = first_result
+                        
+                        if first_result.get('magnet'):
+                            download_link = first_result['magnet']
+                        elif first_result.get('torrent'):
+                            download_link = first_result['torrent']
+                        else:
+                            continue
+                        
+                        text = f"🆕 **Nuevo resultado encontrado para:** `{query}`\n\n"
+                        text += f"**{first_result['name']}**\n"
+                        text += f"📦 Tamaño: {first_result['size']}\n"
+                        text += f"📅 Fecha: {first_result['date']}\n\n"
+                        text += "Iniciando descarga automática..."
+                        
+                        class TempMessage:
+                            def __init__(self, chat_id):
+                                self.chat = type('obj', (object,), {'id': chat_id})
+                                self.text = ""
+                        
+                        temp_msg = TempMessage(chat_id)
+                        
+                        bot = None
+                        for thread in threading.enumerate():
+                            if hasattr(thread, '_target') and thread._target and 'run_bot' in str(thread._target):
+                                bot = getattr(thread, 'bot_instance', None)
+                                break
+                        
+                        if bot:
+                            asyncio.run_coroutine_threadsafe(
+                                bot._send_subscription_notification(chat_id, text, download_link),
+                                bot.app.loop
+                            )
+                            
+            except Exception as e:
+                print(f"Error en subscription check: {e}")
 
 class NekoTelegram:
     def __init__(self, api_id, api_hash, bot_token):
@@ -130,8 +199,8 @@ class NekoTelegram:
         self.bot_token = bot_token
         self.app = Client("nekobot", api_id=int(api_id), api_hash=api_hash, bot_token=bot_token)
         self.nyaa = nyaa.Nyaa_search()
-        self.downloader = TorrentDownloader()
         self.flask_thread = None
+        self.subscription_thread = None
         
         @self.app.on_message(filters.private)
         async def handle_message(client: Client, message: Message):
@@ -142,13 +211,25 @@ class NekoTelegram:
             await self._handle_callback(client, callback_query)
     
     async def _handle_message(self, client: Client, message: Message):
-        if not message.text:
+        if not message.text and not message.document:
+            return
+        
+        if message.document:
+            await self._handle_torrent_file(client, message)
             return
         
         text = message.text.strip()
 
         if text.startswith("/start"):
-            await message.reply("Bot is running!\n\nComandos disponibles:\n/nyaa <búsqueda> - Buscar en Nyaa.si\n/nyaa18 <búsqueda> - Buscar en Sukebei\n/dl <magnet> - Descargar torrent\n/sub <URL> - Suscribirse a RSS")
+            await message.reply("Bot is running!\n\nComandos disponibles:\n/dl <magnet o URL> - Descargar torrent\n/nyaa <query> - Buscar en Nyaa\n/sub <texto> - Suscribirse a búsqueda\n/sub18 <texto> - Suscribirse a búsqueda +18\n/rmsub <texto> - Eliminar suscripción\n/rmsub18 <texto> - Eliminar suscripción +18\n/status <id> - Ver estado de descarga\n/misubs - Ver suscripciones activas")
+        
+        elif text.startswith("/dl "):
+            arg = text[4:].strip()
+            await self._handle_download(client, message, arg)
+        
+        elif text.startswith("/status "):
+            download_id = text[8:].strip()
+            await self._check_status(client, message, download_id)
         
         elif text.startswith("/nyaa "):
             query = text[6:].strip()
@@ -158,13 +239,251 @@ class NekoTelegram:
             query = text[8:].strip()
             await self._search_nyaa(client, message, query, True)
         
-        elif text.startswith("/dl "):
-            magnet = text[4:].strip()
-            await self._download_torrent(client, message, magnet)
-        
         elif text.startswith("/sub "):
-            url = text[5:].strip()
-            await self._subscribe_rss(client, message, url)
+            query = text[5:].strip()
+            await self._add_subscription(client, message, query, False)
+        
+        elif text.startswith("/sub18 "):
+            query = text[7:].strip()
+            await self._add_subscription(client, message, query, True)
+        
+        elif text.startswith("/rmsub "):
+            query = text[7:].strip()
+            await self._remove_subscription(client, message, query, False)
+        
+        elif text.startswith("/rmsub18 "):
+            query = text[9:].strip()
+            await self._remove_subscription(client, message, query, True)
+        
+        elif text == "/misubs":
+            await self._list_subscriptions(client, message)
+    
+    async def _add_subscription(self, client: Client, message: Message, query: str, adult: bool):
+        status_msg = await message.reply(f"🔍 Configurando suscripción para: {query}...")
+        
+        try:
+            if adult:
+                results = self.nyaa.nyaafap(query)
+            else:
+                results = self.nyaa.nyaafun(query)
+            
+            if not results:
+                await status_msg.edit_text("❌ No se encontraron resultados para esta búsqueda.")
+                return
+            
+            first_result = results[0]
+            
+            sub_id = generate_cache_id()
+            
+            with subscription_lock:
+                subscriptions[sub_id] = {
+                    'chat_id': message.chat.id,
+                    'query': query,
+                    'adult': adult,
+                    'last_result': first_result,
+                    'created_at': time.time(),
+                    'message_id': status_msg.id
+                }
+            
+            text = f"✅ **Suscripción activada**\n\n"
+            text += f"**Término:** `{query}`\n"
+            text += f"**Modo:** {'+18' if adult else 'Normal'}\n\n"
+            text += f"**Último resultado guardado:**\n"
+            text += f"**{first_result['name']}**\n"
+            text += f"📦 {first_result['size']} | 📅 {first_result['date']}\n\n"
+            text += "El bot revisará cada minuto y descargará automáticamente nuevos resultados."
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancelar suscripción", callback_data=f"sub_remove_{sub_id}")]
+            ])
+            
+            await status_msg.edit_text(text, reply_markup=keyboard)
+            
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
+    
+    async def _remove_subscription(self, client: Client, message: Message, query: str, adult: bool):
+        removed = False
+        with subscription_lock:
+            for sub_id, sub_data in list(subscriptions.items()):
+                if sub_data['chat_id'] == message.chat.id and sub_data['query'] == query and sub_data['adult'] == adult:
+                    del subscriptions[sub_id]
+                    removed = True
+                    break
+        
+        if removed:
+            await message.reply(f"✅ Suscripción eliminada para: `{query}`")
+        else:
+            await message.reply(f"❌ No se encontró suscripción para: `{query}`")
+    
+    async def _list_subscriptions(self, client: Client, message: Message):
+        user_subs = []
+        with subscription_lock:
+            for sub_id, sub_data in subscriptions.items():
+                if sub_data['chat_id'] == message.chat.id:
+                    user_subs.append((sub_id, sub_data))
+        
+        if not user_subs:
+            await message.reply("📭 No tienes suscripciones activas.")
+            return
+        
+        text = "**📋 Tus suscripciones:**\n\n"
+        for sub_id, sub_data in user_subs:
+            text += f"**Término:** `{sub_data['query']}`\n"
+            text += f"**Modo:** {'+18' if sub_data['adult'] else 'Normal'}\n"
+            text += f"**Último:** {sub_data['last_result']['name'][:50]}...\n"
+            text += f"**Fecha:** {sub_data['last_result']['date']}\n"
+            text += f"`{sub_id}`\n\n"
+        
+        await message.reply(text)
+    
+    async def _send_subscription_notification(self, chat_id, text, download_link):
+        try:
+            msg = await self.app.send_message(chat_id, text)
+            await self._handle_download(self.app, msg, download_link)
+        except Exception as e:
+            print(f"Error sending notification: {e}")
+    
+    async def _handle_torrent_file(self, client: Client, message: Message):
+        if not message.document:
+            return
+            
+        file_name = message.document.file_name
+        if not file_name.endswith('.torrent'):
+            await message.reply("❌ El archivo no es un torrent válido")
+            return
+        
+        status_msg = await message.reply("📥 Descargando archivo torrent...")
+        
+        try:
+            file_path = await message.download()
+            
+            with open(file_path, 'rb') as f:
+                torrent_data = f.read()
+            
+            try:
+                bencodepy.decode(torrent_data)
+            except:
+                os.remove(file_path)
+                await status_msg.edit_text("❌ Archivo torrent inválido")
+                return
+            
+            download_id = download_handler.add_torrent_file(torrent_data, "./downloads")
+            downloads[download_id] = {
+                'chat_id': message.chat.id,
+                'message_id': status_msg.id
+            }
+            
+            os.remove(file_path)
+            
+            await status_msg.edit_text(
+                f"✅ Torrent añadido: {file_name}\n"
+                f"ID: `{download_id}`\n\n"
+                f"Usa /status {download_id} para ver el progreso"
+            )
+            
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
+    
+    async def _handle_download(self, client: Client, message: Message, arg):
+        status_msg = await message.reply("⏳ Procesando...")
+        
+        try:
+            save_path = f"./downloads/{message.chat.id}"
+            os.makedirs(save_path, exist_ok=True)
+            
+            if arg.startswith("magnet:"):
+                download_id = download_handler.add_magnet(arg, save_path)
+                
+                await status_msg.edit_text(
+                    f"✅ Magnet añadido\n"
+                    f"ID: `{download_id}`\n\n"
+                    f"Usa /status {download_id} para ver el progreso"
+                )
+                
+            elif arg.startswith("http://") or arg.startswith("https://"):
+                if arg.endswith(".torrent"):
+                    await status_msg.edit_text("📥 Descargando archivo torrent...")
+                    
+                    response = requests.get(arg, timeout=30)
+                    if response.status_code == 200:
+                        try:
+                            bencodepy.decode(response.content)
+                        except:
+                            await status_msg.edit_text("❌ El archivo descargado no es un torrent válido")
+                            return
+                        
+                        download_id = download_handler.add_torrent_file(response.content, save_path)
+                        
+                        await status_msg.edit_text(
+                            f"✅ Torrent añadido desde URL\n"
+                            f"ID: `{download_id}`\n\n"
+                            f"Usa /status {download_id} para ver el progreso"
+                        )
+                    else:
+                        await status_msg.edit_text(f"❌ Error al descargar: HTTP {response.status_code}")
+                else:
+                    await status_msg.edit_text("❌ La URL no parece ser un archivo .torrent")
+            else:
+                await status_msg.edit_text("❌ Formato no reconocido. Usa un magnet link o URL de archivo .torrent")
+                
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
+    
+    async def _check_status(self, client: Client, message: Message, download_id):
+        status = download_handler.get_status(download_id)
+        
+        if not status:
+            await message.reply("❌ ID de descarga no encontrado")
+            return
+        
+        if status['status'] == 'finished':
+            text = f"✅ **Descarga completada**\n\n"
+            text += f"📁 **Archivo:** {status.get('name', 'Desconocido')}\n"
+            text += f"📊 **Total descargado:** {format_size(status.get('total_download', 0))}\n"
+            text += f"📤 **Total subido:** {format_size(status.get('total_upload', 0))}\n"
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Eliminar", callback_data=f"dl_remove_{download_id}")]
+            ])
+            
+            await message.reply(text, reply_markup=keyboard)
+            
+        elif status['status'] == 'downloading':
+            progress = status.get('progress', 0)
+            download_rate = status.get('download_rate', 0)
+            upload_rate = status.get('upload_rate', 0)
+            num_peers = status.get('num_peers', 0)
+            num_seeds = status.get('num_seeds', 0)
+            
+            bar_length = 20
+            filled = int(bar_length * progress / 100)
+            bar = '█' * filled + '░' * (bar_length - filled)
+            
+            text = f"⬇️ **Descargando...**\n\n"
+            text += f"📁 **Archivo:** {status.get('name', 'Desconocido')}\n"
+            text += f"📊 **Progreso:** {progress:.2f}%\n"
+            text += f"`{bar}`\n\n"
+            text += f"⬇️ **Descarga:** {format_size(download_rate)}/s\n"
+            text += f"⬆️ **Subida:** {format_size(upload_rate)}/s\n"
+            text += f"👥 **Peers:** {num_peers} | 🌱 **Seeds:** {num_seeds}\n"
+            text += f"📥 **Total:** {format_size(status.get('total_download', 0))}\n"
+            text += f"📤 **Subido:** {format_size(status.get('total_upload', 0))}\n"
+            text += f"🔄 **Estado:** {status.get('state', 'Desconocido')}\n\n"
+            text += f"ID: `{download_id}`"
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Actualizar", callback_data=f"dl_status_{download_id}"),
+                 InlineKeyboardButton("🗑️ Eliminar", callback_data=f"dl_remove_{download_id}")]
+            ])
+            
+            msg = await message.reply(text, reply_markup=keyboard)
+            
+            if download_id not in downloads:
+                downloads[download_id] = {}
+            downloads[download_id]['last_status_msg'] = msg.id
+        else:
+            await message.reply("❌ Estado desconocido")
     
     async def _search_nyaa(self, client: Client, message: Message, query: str, adult: bool):
         status_msg = await message.reply(f"🔍 Buscando: {query}...")
@@ -180,12 +499,7 @@ class NekoTelegram:
                 return
             
             cache_id = generate_cache_id()
-            search_cache[cache_id] = {
-                'results': results[:20],
-                'query': query,
-                'adult': adult,
-                'timestamp': time.time()
-            }
+            search_cache[cache_id] = results
             
             await self._show_results_page(status_msg, cache_id, 1)
             
@@ -193,111 +507,46 @@ class NekoTelegram:
             await status_msg.edit_text(f"❌ Error: {str(e)}")
     
     async def _show_results_page(self, message: Message, cache_id: str, page: int):
-        cache_data = search_cache.get(cache_id)
-        if not cache_data:
-            await message.edit_text("❌ Búsqueda expirada.")
+        results = search_cache.get(cache_id, [])
+        if not results:
+            await message.edit_text("❌ Resultados expirados.")
             return
         
-        results = cache_data['results']
-        query = cache_data['query']
-        
-        total_pages = max(1, (len(results) - 1) // 5 + 1)
+        total_pages = (len(results) + 4) // 5
         page = max(1, min(page, total_pages))
         
         start_idx = (page - 1) * 5
         end_idx = min(start_idx + 5, len(results))
         
-        text = f"**Resultados para:** `{query}`\n"
-        text += f"**Página {page}/{total_pages}**\n\n"
-        
+        text = f"**Resultados (Página {page}/{total_pages})**\n\n"
         for i in range(start_idx, end_idx):
             result = results[i]
             text += f"**{i+1}.** {result['name'][:100]}\n"
             text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
         
         keyboard = []
-        
         for i in range(start_idx, end_idx):
             keyboard.append([InlineKeyboardButton(
-                f"📥 {i+1}. {result['name'][:30]}...", 
-                callback_data=f"nyaa_{cache_id}_{i}"
+                f"📥 {i+1}. {results[i]['name'][:30]}...", 
+                callback_data=f"nyaa_detail_{cache_id}_{i}"
             )])
         
         nav_row = []
         if page > 1:
             nav_row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"nyaa_page_{cache_id}_{page-1}"))
+        else:
+            nav_row.append(InlineKeyboardButton("⬅️ Anterior", callback_data="noop"))
         
         nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
         
         if page < total_pages:
             nav_row.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"nyaa_page_{cache_id}_{page+1}"))
+        else:
+            nav_row.append(InlineKeyboardButton("Siguiente ➡️", callback_data="noop"))
         
         keyboard.append(nav_row)
         
         await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    
-    async def _download_torrent(self, client: Client, message: Message, magnet: str):
-        if not magnet.startswith('magnet:'):
-            await message.reply("❌ El enlace no parece ser un magnet válido.")
-            return
-        
-        download_id = str(uuid.uuid4())[:8]
-        status_msg = await message.reply(f"📥 Iniciando descarga...\nID: {download_id}")
-        
-        download_path = os.path.join(os.getcwd(), "downloads", download_id)
-        os.makedirs(download_path, exist_ok=True)
-        
-        try:
-            async for update in self.downloader.download_magnet(magnet, download_path):
-                if isinstance(update, tuple):
-                    if update[0] == "file":
-                        file_path = update[1]
-                        await status_msg.delete()
-                        await message.reply_document(
-                            document=file_path,
-                            caption=f"✅ Descarga completada: {os.path.basename(file_path)}"
-                        )
-                        shutil.rmtree(download_path, ignore_errors=True)
-                        break
-                    elif update[0] == "folder":
-                        folder_path = update[1]
-                        await status_msg.delete()
-                        
-                        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-                        shutil.make_archive(temp_zip.name.replace('.zip', ''), 'zip', folder_path)
-                        
-                        await message.reply_document(
-                            document=temp_zip.name,
-                            caption=f"✅ Carpeta comprimida: {os.path.basename(folder_path)}.zip"
-                        )
-                        
-                        os.unlink(temp_zip.name)
-                        shutil.rmtree(download_path, ignore_errors=True)
-                        break
-                    elif update[0] == "error":
-                        await status_msg.edit_text(f"❌ Error: {update[1]}")
-                        break
-                else:
-                    await status_msg.edit_text(update)
-                    
-        except Exception as e:
-            await status_msg.edit_text(f"❌ Error en descarga: {str(e)}")
-            shutil.rmtree(download_path, ignore_errors=True)
-    
-    async def _subscribe_rss(self, client: Client, message: Message, url: str):
-        sub_id = generate_cache_id()
-        subs_cache[sub_id] = {
-            'url': url,
-            'user_id': message.from_user.id,
-            'timestamp': time.time()
-        }
-        
-        await message.reply(
-            f"✅ Suscrito a RSS feed!\n\nID: {sub_id}\nURL: {url}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Cancelar suscripción", callback_data=f"unsub_{sub_id}")
-            ]])
-        )
     
     async def _handle_callback(self, client: Client, callback_query: CallbackQuery):
         data = callback_query.data
@@ -306,111 +555,102 @@ class NekoTelegram:
             await callback_query.answer()
             return
         
-        if data.startswith("nyaa_page_"):
+        if data.startswith("sub_remove_"):
+            sub_id = data[11:]
+            with subscription_lock:
+                if sub_id in subscriptions:
+                    del subscriptions[sub_id]
+                    await callback_query.message.edit_text("✅ Suscripción cancelada")
+                    await callback_query.answer()
+                else:
+                    await callback_query.answer("Suscripción no encontrada", show_alert=True)
+            return
+        
+        if data.startswith("dl_"):
             parts = data.split("_")
-            cache_id = parts[2]
-            page = int(parts[3])
             
-            await self._show_results_page(callback_query.message, cache_id, page)
-            await callback_query.answer()
-            
-        elif data.startswith("nyaa_"):
-            parts = data.split("_")
-            if len(parts) == 3 and parts[1] != "page":
-                cache_id = parts[1]
-                index = int(parts[2])
+            if parts[1] == "status":
+                download_id = parts[2]
+                await self._check_status(client, callback_query.message, download_id)
+                await callback_query.answer()
                 
-                cache_data = search_cache.get(cache_id)
-                if not cache_data:
-                    await callback_query.answer("❌ Búsqueda expirada")
+            elif parts[1] == "remove":
+                download_id = parts[2]
+                if download_handler.remove_download(download_id):
+                    await callback_query.message.edit_text("✅ Descarga eliminada")
+                else:
+                    await callback_query.answer("Error al eliminar", show_alert=True)
+                await callback_query.answer()
+                
+            return
+        
+        if data.startswith("nyaa_"):
+            parts = data.split("_")
+            
+            if parts[1] == "page":
+                cache_id = parts[2]
+                page = int(parts[3])
+                await self._show_results_page(callback_query.message, cache_id, page)
+                await callback_query.answer()
+                
+            elif parts[1] == "detail":
+                cache_id = parts[2]
+                idx = int(parts[3])
+                
+                results = search_cache.get(cache_id, [])
+                if not results or idx >= len(results):
+                    await callback_query.answer("Resultado no encontrado", show_alert=True)
                     return
                 
-                results = cache_data['results']
-                if index >= len(results):
-                    await callback_query.answer("❌ Resultado no válido")
-                    return
-                
-                result = results[index]
+                result = results[idx]
                 
                 text = f"**{result['name']}**\n\n"
-                text += f"📦 Tamaño: {result['size']}\n"
-                text += f"📅 Fecha: {result['date']}\n\n"
+                text += f"📦 **Tamaño:** {result['size']}\n"
+                text += f"📅 **Fecha:** {result['date']}\n\n"
                 
-                download_id = generate_cache_id()
-                download_tasks[download_id] = (result['magnet'], result['name'])
+                keyboard = []
+                if result.get('magnet'):
+                    keyboard.append([InlineKeyboardButton("🧲 Descargar Magnet", callback_data=f"nyaa_dl_magnet_{cache_id}_{idx}")])
+                if result.get('torrent'):
+                    keyboard.append([InlineKeyboardButton("⬇️ Descargar Torrent", callback_data=f"nyaa_dl_torrent_{cache_id}_{idx}")])
                 
-                keyboard = [
-                    [InlineKeyboardButton("🧲 Magnet", url=result['magnet'])],
-                    [InlineKeyboardButton("⬇️ Torrent", url=result['torrent'])],
-                    [InlineKeyboardButton("📥 Descargar ahora", callback_data=f"download_{download_id}")],
-                    [InlineKeyboardButton("🔙 Volver", callback_data=f"nyaa_page_{cache_id}_1")]
-                ]
+                keyboard.append([InlineKeyboardButton("🔙 Volver", callback_data=f"nyaa_page_{cache_id}_1")])
                 
                 await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
                 await callback_query.answer()
-        
-        elif data.startswith("download_"):
-            download_id = data.replace("download_", "")
-            
-            if download_id in download_tasks:
-                magnet, name = download_tasks[download_id]
                 
-                await callback_query.message.edit_text(f"📥 Iniciando descarga: {name}...")
-                
-                download_path = os.path.join(os.getcwd(), "downloads", download_id)
-                os.makedirs(download_path, exist_ok=True)
-                
-                try:
-                    status_msg = await callback_query.message.reply("⏳ Iniciando descarga...")
+            elif parts[1] == "dl":
+                if parts[2] == "magnet":
+                    cache_id = parts[3]
+                    idx = int(parts[4])
                     
-                    async for update in self.downloader.download_magnet(magnet, download_path):
-                        if isinstance(update, tuple):
-                            if update[0] == "file":
-                                file_path = update[1]
-                                await status_msg.delete()
-                                await callback_query.message.reply_document(
-                                    document=file_path,
-                                    caption=f"✅ Descarga completada: {os.path.basename(file_path)}"
-                                )
-                                shutil.rmtree(download_path, ignore_errors=True)
-                                break
-                            elif update[0] == "folder":
-                                folder_path = update[1]
-                                await status_msg.delete()
-                                
-                                temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
-                                shutil.make_archive(temp_zip.name.replace('.zip', ''), 'zip', folder_path)
-                                
-                                await callback_query.message.reply_document(
-                                    document=temp_zip.name,
-                                    caption=f"✅ Carpeta comprimida: {os.path.basename(folder_path)}.zip"
-                                )
-                                
-                                os.unlink(temp_zip.name)
-                                shutil.rmtree(download_path, ignore_errors=True)
-                                break
-                            elif update[0] == "error":
-                                await status_msg.edit_text(f"❌ Error: {update[1]}")
-                                break
-                        else:
-                            await status_msg.edit_text(update)
-                            
-                except Exception as e:
-                    await callback_query.message.reply(f"❌ Error en descarga: {str(e)}")
-                    shutil.rmtree(download_path, ignore_errors=True)
-                
-                del download_tasks[download_id]
-            
-            await callback_query.answer()
-            
-        elif data.startswith("unsub_"):
-            sub_id = data.replace("unsub_", "")
-            
-            if sub_id in subs_cache:
-                del subs_cache[sub_id]
-                await callback_query.message.edit_text("✅ Suscripción cancelada.")
-            else:
-                await callback_query.answer("❌ Suscripción no encontrada")
+                    results = search_cache.get(cache_id, [])
+                    if not results or idx >= len(results):
+                        await callback_query.answer("Resultado no encontrado", show_alert=True)
+                        return
+                    
+                    magnet = results[idx].get('magnet')
+                    if magnet:
+                        await callback_query.answer("Iniciando descarga...")
+                        await self._handle_download(client, callback_query.message, magnet)
+                    else:
+                        await callback_query.answer("No hay magnet disponible", show_alert=True)
+                        
+                elif parts[2] == "torrent":
+                    cache_id = parts[3]
+                    idx = int(parts[4])
+                    
+                    results = search_cache.get(cache_id, [])
+                    if not results or idx >= len(results):
+                        await callback_query.answer("Resultado no encontrado", show_alert=True)
+                        return
+                    
+                    torrent = results[idx].get('torrent')
+                    if torrent:
+                        await callback_query.answer("Iniciando descarga...")
+                        await self._handle_download(client, callback_query.message, torrent)
+                    else:
+                        await callback_query.answer("No hay torrent disponible", show_alert=True)
     
     def start_flask(self):
         if self.flask_thread and self.flask_thread.is_alive():
@@ -419,7 +659,13 @@ class NekoTelegram:
         self.flask_thread = threading.Thread(target=run_flask, daemon=True)
         self.flask_thread.start()
     
+    def start_subscription_checker(self):
+        schedule.every(1).minutes.do(check_subscriptions)
+        self.subscription_thread = threading.Thread(target=subscription_worker, daemon=True)
+        self.subscription_thread.start()
+    
     def run(self):
+        self.start_subscription_checker()
         self.app.run()
 
 def main():
@@ -438,7 +684,7 @@ def main():
         print("Error: Faltan credenciales")
         sys.exit(1)
     
-    os.makedirs("downloads", exist_ok=True)
+    os.makedirs("./downloads", exist_ok=True)
     
     bot = NekoTelegram(api_id, api_hash, bot_token)
 
