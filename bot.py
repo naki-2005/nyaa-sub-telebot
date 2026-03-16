@@ -7,6 +7,9 @@ import string
 import asyncio
 import shutil
 import tempfile
+import time
+import re
+import uuid
 from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -26,6 +29,7 @@ def run_flask():
 
 search_cache = {}
 download_tasks = {}
+subs_cache = {}
 
 def generate_cache_id():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
@@ -44,7 +48,6 @@ class TorrentDownloader:
     def add_torrent(self, ses, magnet_uri, save_path):
         params = {'save_path': save_path, 'storage_mode': lt.storage_mode_t.storage_mode_sparse}
         handle = lt.add_magnet_uri(ses, magnet_uri, params)
-        handle.set_sequential_download(False)
         return handle
     
     async def wait_for_metadata(self, handle):
@@ -145,7 +148,7 @@ class NekoTelegram:
         text = message.text.strip()
 
         if text.startswith("/start"):
-            await message.reply("Bot is running!")
+            await message.reply("Bot is running!\n\nComandos disponibles:\n/nyaa <búsqueda> - Buscar en Nyaa.si\n/nyaa18 <búsqueda> - Buscar en Sukebei\n/dl <magnet> - Descargar torrent\n/sub <URL> - Suscribirse a RSS")
         
         elif text.startswith("/nyaa "):
             query = text[6:].strip()
@@ -154,6 +157,14 @@ class NekoTelegram:
         elif text.startswith("/nyaa18 "):
             query = text[8:].strip()
             await self._search_nyaa(client, message, query, True)
+        
+        elif text.startswith("/dl "):
+            magnet = text[4:].strip()
+            await self._download_torrent(client, message, magnet)
+        
+        elif text.startswith("/sub "):
+            url = text[5:].strip()
+            await self._subscribe_rss(client, message, url)
     
     async def _search_nyaa(self, client: Client, message: Message, query: str, adult: bool):
         status_msg = await message.reply(f"🔍 Buscando: {query}...")
@@ -169,28 +180,125 @@ class NekoTelegram:
                 return
             
             cache_id = generate_cache_id()
-            search_cache[cache_id] = results[:20]
+            search_cache[cache_id] = {
+                'results': results[:20],
+                'query': query,
+                'adult': adult,
+                'timestamp': time.time()
+            }
             
-            text = f"**Resultados para:** `{query}`\n\n"
-            for i, result in enumerate(results[:5], 1):
-                text += f"{i}. **{result['name'][:50]}**...\n"
-                text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
-            
-            keyboard = []
-            for i, result in enumerate(results[:10], 1):
-                keyboard.append([InlineKeyboardButton(f"{i}. {result['name'][:30]}...", callback_data=f"nyaa_{cache_id}_{i-1}")])
-            
-            if len(results) > 5:
-                keyboard.append([
-                    InlineKeyboardButton("⬅️ Anterior", callback_data=f"nyaa_page_{cache_id}_prev"),
-                    InlineKeyboardButton(f"1/{max(1, (len(results)-1)//5 + 1)}", callback_data="noop"),
-                    InlineKeyboardButton("Siguiente ➡️", callback_data=f"nyaa_page_{cache_id}_next")
-                ])
-            
-            await status_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await self._show_results_page(status_msg, cache_id, 1)
             
         except Exception as e:
             await status_msg.edit_text(f"❌ Error: {str(e)}")
+    
+    async def _show_results_page(self, message: Message, cache_id: str, page: int):
+        cache_data = search_cache.get(cache_id)
+        if not cache_data:
+            await message.edit_text("❌ Búsqueda expirada.")
+            return
+        
+        results = cache_data['results']
+        query = cache_data['query']
+        
+        total_pages = max(1, (len(results) - 1) // 5 + 1)
+        page = max(1, min(page, total_pages))
+        
+        start_idx = (page - 1) * 5
+        end_idx = min(start_idx + 5, len(results))
+        
+        text = f"**Resultados para:** `{query}`\n"
+        text += f"**Página {page}/{total_pages}**\n\n"
+        
+        for i in range(start_idx, end_idx):
+            result = results[i]
+            text += f"**{i+1}.** {result['name'][:100]}\n"
+            text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
+        
+        keyboard = []
+        row = []
+        
+        for i in range(start_idx, end_idx):
+            keyboard.append([InlineKeyboardButton(
+                f"📥 {i+1}. {result['name'][:30]}...", 
+                callback_data=f"select_{cache_id}_{i}"
+            )])
+        
+        nav_row = []
+        if page > 1:
+            nav_row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"page_{cache_id}_{page-1}"))
+        
+        nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
+        
+        if page < total_pages:
+            nav_row.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"page_{cache_id}_{page+1}"))
+        
+        keyboard.append(nav_row)
+        
+        await message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    
+    async def _download_torrent(self, client: Client, message: Message, magnet: str):
+        if not magnet.startswith('magnet:'):
+            await message.reply("❌ El enlace no parece ser un magnet válido.")
+            return
+        
+        download_id = str(uuid.uuid4())[:8]
+        status_msg = await message.reply(f"📥 Iniciando descarga...\nID: {download_id}")
+        
+        download_path = os.path.join(os.getcwd(), "downloads", download_id)
+        os.makedirs(download_path, exist_ok=True)
+        
+        try:
+            async for update in self.downloader.download_magnet(magnet, download_path):
+                if isinstance(update, tuple):
+                    if update[0] == "file":
+                        file_path = update[1]
+                        await status_msg.delete()
+                        await message.reply_document(
+                            document=file_path,
+                            caption=f"✅ Descarga completada: {os.path.basename(file_path)}"
+                        )
+                        shutil.rmtree(download_path, ignore_errors=True)
+                        break
+                    elif update[0] == "folder":
+                        folder_path = update[1]
+                        await status_msg.delete()
+                        
+                        temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
+                        shutil.make_archive(temp_zip.name.replace('.zip', ''), 'zip', folder_path)
+                        
+                        await message.reply_document(
+                            document=temp_zip.name,
+                            caption=f"✅ Carpeta comprimida: {os.path.basename(folder_path)}.zip"
+                        )
+                        
+                        os.unlink(temp_zip.name)
+                        shutil.rmtree(download_path, ignore_errors=True)
+                        break
+                    elif update[0] == "error":
+                        await status_msg.edit_text(f"❌ Error: {update[1]}")
+                        break
+                else:
+                    await status_msg.edit_text(update)
+                    
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error en descarga: {str(e)}")
+            shutil.rmtree(download_path, ignore_errors=True)
+    
+    async def _subscribe_rss(self, client: Client, message: Message, url: str):
+        sub_id = generate_cache_id()
+        subs_cache[sub_id] = {
+            'url': url,
+            'user_id': message.from_user.id,
+            'timestamp': time.time()
+        }
+        
+        await message.reply(
+            f"✅ Suscrito a RSS feed!\n\nID: {sub_id}\nURL: {url}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancelar suscripción", callback_data=f"unsub_{sub_id}")
+            ]])
+        )
     
     async def _handle_callback(self, client: Client, callback_query: CallbackQuery):
         data = callback_query.data
@@ -199,7 +307,44 @@ class NekoTelegram:
             await callback_query.answer()
             return
         
-        if data.startswith("download_"):
+        if data.startswith("page_"):
+            parts = data.split("_")
+            cache_id = parts[1]
+            page = int(parts[2])
+            
+            await self._show_results_page(callback_query.message, cache_id, page)
+            await callback_query.answer()
+            
+        elif data.startswith("select_"):
+            parts = data.split("_")
+            cache_id = parts[1]
+            index = int(parts[2])
+            
+            cache_data = search_cache.get(cache_id)
+            if not cache_data:
+                await callback_query.answer("❌ Búsqueda expirada")
+                return
+            
+            result = cache_data['results'][index]
+            
+            text = f"**{result['name']}**\n\n"
+            text += f"📦 Tamaño: {result['size']}\n"
+            text += f"📅 Fecha: {result['date']}\n\n"
+            
+            download_id = generate_cache_id()
+            download_tasks[download_id] = (result['magnet'], result['name'])
+            
+            keyboard = [
+                [InlineKeyboardButton("🧲 Magnet", url=result['magnet'])],
+                [InlineKeyboardButton("⬇️ Torrent", url=result['torrent'])],
+                [InlineKeyboardButton("📥 Descargar ahora", callback_data=f"download_{download_id}")],
+                [InlineKeyboardButton("🔙 Volver", callback_data=f"page_{cache_id}_1")]
+            ]
+            
+            await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await callback_query.answer()
+            
+        elif data.startswith("download_"):
             download_id = data.replace("download_", "")
             
             if download_id in download_tasks:
@@ -207,171 +352,60 @@ class NekoTelegram:
                 
                 await callback_query.message.edit_text(f"📥 Iniciando descarga: {name}...")
                 
+                download_path = os.path.join(os.getcwd(), "downloads", download_id)
+                os.makedirs(download_path, exist_ok=True)
+                
                 try:
-                    download_path = os.path.join(os.getcwd(), "downloads", download_id)
-                    os.makedirs(download_path, exist_ok=True)
-                    
-                    progress_msg = await callback_query.message.reply("⏳ Iniciando descarga...")
+                    status_msg = await callback_query.message.reply("⏳ Iniciando descarga...")
                     
                     async for update in self.downloader.download_magnet(magnet, download_path):
                         if isinstance(update, tuple):
                             if update[0] == "file":
                                 file_path = update[1]
-                                await progress_msg.delete()
+                                await status_msg.delete()
                                 await callback_query.message.reply_document(
                                     document=file_path,
-                                    caption=f"✅ Descarga completada: {os.path.basename(file_path)}",
-                                    progress=self._progress_callback
+                                    caption=f"✅ Descarga completada: {os.path.basename(file_path)}"
                                 )
                                 shutil.rmtree(download_path, ignore_errors=True)
                                 break
                             elif update[0] == "folder":
                                 folder_path = update[1]
-                                await progress_msg.delete()
+                                await status_msg.delete()
                                 
                                 temp_zip = tempfile.NamedTemporaryFile(delete=False, suffix='.zip')
                                 shutil.make_archive(temp_zip.name.replace('.zip', ''), 'zip', folder_path)
                                 
                                 await callback_query.message.reply_document(
                                     document=temp_zip.name,
-                                    caption=f"✅ Carpeta comprimida: {os.path.basename(folder_path)}.zip",
-                                    progress=self._progress_callback
+                                    caption=f"✅ Carpeta comprimida: {os.path.basename(folder_path)}.zip"
                                 )
                                 
                                 os.unlink(temp_zip.name)
                                 shutil.rmtree(download_path, ignore_errors=True)
                                 break
                             elif update[0] == "error":
-                                await progress_msg.edit_text(f"❌ Error: {update[1]}")
+                                await status_msg.edit_text(f"❌ Error: {update[1]}")
                                 break
                         else:
-                            await progress_msg.edit_text(update)
-                    
+                            await status_msg.edit_text(update)
+                            
                 except Exception as e:
                     await callback_query.message.reply(f"❌ Error en descarga: {str(e)}")
+                    shutil.rmtree(download_path, ignore_errors=True)
                 
                 del download_tasks[download_id]
             
             await callback_query.answer()
-            return
-        
-        if data.startswith("nyaa_"):
-            parts = data.split("_")
             
-            if parts[1] == "page":
-                cache_id = parts[2]
-                action = parts[3]
-                
-                if cache_id not in search_cache:
-                    await callback_query.answer("Búsqueda expirada")
-                    return
-                
-                results = search_cache[cache_id]
-                msg_text = callback_query.message.text
-                
-                import re
-                page_match = re.search(r'Página (\d+)/(\d+)', msg_text)
-                if page_match:
-                    current_page = int(page_match.group(1))
-                    total_pages = int(page_match.group(2))
-                else:
-                    current_page = 1
-                    total_pages = max(1, (len(results)-1)//5 + 1)
-                
-                if action == "next":
-                    current_page += 1
-                elif action == "prev":
-                    current_page -= 1
-                
-                current_page = max(1, min(current_page, total_pages))
-                
-                start_idx = (current_page - 1) * 5
-                end_idx = min(start_idx + 5, len(results))
-                
-                text = f"**Resultados (Página {current_page}/{total_pages})**\n\n"
-                for i in range(start_idx, end_idx):
-                    result = results[i]
-                    text += f"{i+1}. **{result['name'][:50]}**...\n"
-                    text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
-                
-                keyboard = []
-                for i in range(start_idx, end_idx):
-                    keyboard.append([InlineKeyboardButton(f"{i+1}. {results[i]['name'][:30]}...", callback_data=f"nyaa_detail_{cache_id}_{i}")])
-                
-                nav_buttons = []
-                if current_page > 1:
-                    nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"nyaa_page_{cache_id}_prev"))
-                else:
-                    nav_buttons.append(InlineKeyboardButton("⬅️ Anterior", callback_data="noop"))
-                
-                nav_buttons.append(InlineKeyboardButton(f"{current_page}/{total_pages}", callback_data="noop"))
-                
-                if current_page < total_pages:
-                    nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"nyaa_page_{cache_id}_next"))
-                else:
-                    nav_buttons.append(InlineKeyboardButton("Siguiente ➡️", callback_data="noop"))
-                
-                keyboard.append(nav_buttons)
-                
-                await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-                await callback_query.answer()
+        elif data.startswith("unsub_"):
+            sub_id = data.replace("unsub_", "")
             
-            elif parts[1] == "detail":
-                cache_id = parts[2]
-                result_idx = int(parts[3])
-                
-                if cache_id not in search_cache:
-                    await callback_query.answer("Búsqueda expirada")
-                    return
-                
-                result = search_cache[cache_id][result_idx]
-                
-                text = f"**{result['name']}**\n\n"
-                text += f"📦 Tamaño: {result['size']}\n"
-                text += f"📅 Fecha: {result['date']}\n\n"
-                
-                download_id = generate_cache_id()
-                download_tasks[download_id] = (result['magnet'], result['name'])
-                
-                keyboard = [
-                    [InlineKeyboardButton("🧲 Magnet", url=result['magnet'])],
-                    [InlineKeyboardButton("⬇️ Torrent", url=result['torrent'])],
-                    [InlineKeyboardButton("📥 Descargar", callback_data=f"download_{download_id}")],
-                    [InlineKeyboardButton("🔙 Volver", callback_data=f"nyaa_page_{cache_id}_1")]
-                ]
-                
-                await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-                await callback_query.answer()
-            
+            if sub_id in subs_cache:
+                del subs_cache[sub_id]
+                await callback_query.message.edit_text("✅ Suscripción cancelada.")
             else:
-                cache_id = parts[1]
-                result_idx = int(parts[2])
-                
-                if cache_id not in search_cache:
-                    await callback_query.answer("Búsqueda expirada")
-                    return
-                
-                result = search_cache[cache_id][result_idx]
-                
-                text = f"**{result['name']}**\n\n"
-                text += f"📦 Tamaño: {result['size']}\n"
-                text += f"📅 Fecha: {result['date']}\n\n"
-                
-                download_id = generate_cache_id()
-                download_tasks[download_id] = (result['magnet'], result['name'])
-                
-                keyboard = [
-                    [InlineKeyboardButton("🧲 Magnet", url=result['magnet'])],
-                    [InlineKeyboardButton("⬇️ Torrent", url=result['torrent'])],
-                    [InlineKeyboardButton("📥 Descargar", callback_data=f"download_{download_id}")],
-                    [InlineKeyboardButton("🔙 Volver", callback_data=f"nyaa_page_{cache_id}_1")]
-                ]
-                
-                await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-                await callback_query.answer()
-    
-    async def _progress_callback(self, current, total):
-        pass
+                await callback_query.answer("❌ Suscripción no encontrada")
     
     def start_flask(self):
         if self.flask_thread and self.flask_thread.is_alive():
