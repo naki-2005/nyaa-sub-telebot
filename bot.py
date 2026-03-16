@@ -216,22 +216,21 @@ class NekoTelegram:
             text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
         
         keyboard = []
-        row = []
         
         for i in range(start_idx, end_idx):
             keyboard.append([InlineKeyboardButton(
                 f"📥 {i+1}. {result['name'][:30]}...", 
-                callback_data=f"select_{cache_id}_{i}"
+                callback_data=f"nyaa_{cache_id}_{i}"
             )])
         
         nav_row = []
         if page > 1:
-            nav_row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"page_{cache_id}_{page-1}"))
+            nav_row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"nyaa_page_{cache_id}_{page-1}"))
         
         nav_row.append(InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
         
         if page < total_pages:
-            nav_row.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"page_{cache_id}_{page+1}"))
+            nav_row.append(InlineKeyboardButton("Siguiente ➡️", callback_data=f"nyaa_page_{cache_id}_{page+1}"))
         
         keyboard.append(nav_row)
         
@@ -307,43 +306,49 @@ class NekoTelegram:
             await callback_query.answer()
             return
         
-        if data.startswith("page_"):
+        if data.startswith("nyaa_page_"):
             parts = data.split("_")
-            cache_id = parts[1]
-            page = int(parts[2])
+            cache_id = parts[2]
+            page = int(parts[3])
             
             await self._show_results_page(callback_query.message, cache_id, page)
             await callback_query.answer()
             
-        elif data.startswith("select_"):
+        elif data.startswith("nyaa_"):
             parts = data.split("_")
-            cache_id = parts[1]
-            index = int(parts[2])
-            
-            cache_data = search_cache.get(cache_id)
-            if not cache_data:
-                await callback_query.answer("❌ Búsqueda expirada")
-                return
-            
-            result = cache_data['results'][index]
-            
-            text = f"**{result['name']}**\n\n"
-            text += f"📦 Tamaño: {result['size']}\n"
-            text += f"📅 Fecha: {result['date']}\n\n"
-            
-            download_id = generate_cache_id()
-            download_tasks[download_id] = (result['magnet'], result['name'])
-            
-            keyboard = [
-                [InlineKeyboardButton("🧲 Magnet", url=result['magnet'])],
-                [InlineKeyboardButton("⬇️ Torrent", url=result['torrent'])],
-                [InlineKeyboardButton("📥 Descargar ahora", callback_data=f"download_{download_id}")],
-                [InlineKeyboardButton("🔙 Volver", callback_data=f"page_{cache_id}_1")]
-            ]
-            
-            await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-            await callback_query.answer()
-            
+            if len(parts) == 3 and parts[1] != "page":
+                cache_id = parts[1]
+                index = int(parts[2])
+                
+                cache_data = search_cache.get(cache_id)
+                if not cache_data:
+                    await callback_query.answer("❌ Búsqueda expirada")
+                    return
+                
+                results = cache_data['results']
+                if index >= len(results):
+                    await callback_query.answer("❌ Resultado no válido")
+                    return
+                
+                result = results[index]
+                
+                text = f"**{result['name']}**\n\n"
+                text += f"📦 Tamaño: {result['size']}\n"
+                text += f"📅 Fecha: {result['date']}\n\n"
+                
+                download_id = generate_cache_id()
+                download_tasks[download_id] = (result['magnet'], result['name'])
+                
+                keyboard = [
+                    [InlineKeyboardButton("🧲 Magnet", url=result['magnet'])],
+                    [InlineKeyboardButton("⬇️ Torrent", url=result['torrent'])],
+                    [InlineKeyboardButton("📥 Descargar ahora", callback_data=f"download_{download_id}")],
+                    [InlineKeyboardButton("🔙 Volver", callback_data=f"nyaa_page_{cache_id}_1")]
+                ]
+                
+                await callback_query.message.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+                await callback_query.answer()
+        
         elif data.startswith("download_"):
             download_id = data.replace("download_", "")
             
