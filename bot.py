@@ -10,6 +10,7 @@ import libtorrent as lt
 import bencodepy
 import time
 import schedule
+import asyncio
 from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -50,7 +51,6 @@ class DownloadHandler:
         params = {
             'save_path': save_path,
             'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-            'paused': False,
             'auto_managed': True,
             'duplicate_is_error': True
         }
@@ -73,7 +73,6 @@ class DownloadHandler:
         params = {
             'save_path': save_path,
             'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-            'paused': False,
             'auto_managed': True,
             'ti': info
         }
