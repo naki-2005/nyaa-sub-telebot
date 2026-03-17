@@ -10,6 +10,7 @@ import tempfile
 import time
 import re
 import uuid
+import schedule
 from flask import Flask
 from pyrogram import Client, filters
 from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
@@ -27,9 +28,10 @@ def base_flask():
 def run_flask():
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 
-# Cache sin expiración
 search_cache = {}
 download_tasks = {}
+subscriptions = {}
+subscription_lock = threading.Lock()
 
 def generate_cache_id():
     return ''.join(random.choices(string.ascii_letters + string.digits, k=8))
@@ -125,6 +127,67 @@ class TorrentDownloader:
 
 downloader = TorrentDownloader()
 
+def subscription_worker():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
+
+def check_subscriptions():
+    with subscription_lock:
+        for sub_id, sub_data in list(subscriptions.items()):
+            try:
+                chat_id = sub_data['chat_id']
+                query = sub_data['query']
+                adult = sub_data['adult']
+                last_result = sub_data['last_result']
+                
+                nyaa_search = nyaa.Nyaa_search()
+                if adult:
+                    results = nyaa_search.nyaafap(query)
+                else:
+                    results = nyaa_search.nyaafun(query)
+                
+                if results and len(results) > 0:
+                    first_result = results[0]
+                    
+                    if last_result is None or first_result['date'] != last_result['date']:
+                        sub_data['last_result'] = first_result
+                        
+                        if first_result.get('magnet'):
+                            download_link = first_result['magnet']
+                        elif first_result.get('torrent'):
+                            download_link = first_result['torrent']
+                        else:
+                            continue
+                        
+                        text = f"🆕 **Nuevo resultado encontrado para:** `{query}`\n\n"
+                        text += f"**{first_result['name']}**\n"
+                        text += f"📦 Tamaño: {first_result['size']}\n"
+                        text += f"📅 Fecha: {first_result['date']}\n\n"
+                        text += "Iniciando descarga automática..."
+                        
+                        class TempMessage:
+                            def __init__(self, chat_id):
+                                self.chat = type('obj', (object,), {'id': chat_id})
+                                self.text = ""
+                        
+                        temp_msg = TempMessage(chat_id)
+                        
+                        bot = None
+                        for thread in threading.enumerate():
+                            if hasattr(thread, '_target') and thread._target and 'run_bot' in str(thread._target):
+                                bot = getattr(thread, 'bot_instance', None)
+                                break
+                        
+                        if bot:
+                            asyncio.run_coroutine_threadsafe(
+                                bot._send_subscription_notification(chat_id, text, download_link),
+                                bot.app.loop
+                            )
+                            
+            except Exception as e:
+                print(f"Error en subscription check: {e}")
+
 class NekoTelegram:
     def __init__(self, api_id, api_hash, bot_token):
         self.api_id = api_id
@@ -133,6 +196,7 @@ class NekoTelegram:
         self.app = Client("nekobot", api_id=int(api_id), api_hash=api_hash, bot_token=bot_token)
         self.nyaa = nyaa.Nyaa_search()
         self.flask_thread = None
+        self.subscription_thread = None
         
         @self.app.on_message(filters.private)
         async def handle_message(client: Client, message: Message):
@@ -149,7 +213,7 @@ class NekoTelegram:
         text = message.text.strip()
 
         if text.startswith("/start"):
-            await message.reply("Bot is running!\n\nComandos disponibles:\n/nyaa <búsqueda> - Buscar en Nyaa.si\n/nyaa18 <búsqueda> - Buscar en Sukebei\n/dl <magnet> - Descargar torrent")
+            await message.reply("Bot is running!\n\nComandos disponibles:\n/nyaa <búsqueda> - Buscar en Nyaa.si\n/nyaa18 <búsqueda> - Buscar en Sukebei\n/dl <magnet> - Descargar torrent\n/sub <término> - Suscribirse a Nyaa\n/sub18 <término> - Suscribirse a Sukebei\n/rmsub <término> - Eliminar suscripción Nyaa\n/rmsub18 <término> - Eliminar suscripción Sukebei\n/misubs - Ver suscripciones")
         
         elif text.startswith("/nyaa "):
             query = text[6:].strip()
@@ -162,6 +226,110 @@ class NekoTelegram:
         elif text.startswith("/dl "):
             magnet = text[4:].strip()
             await self._download_torrent(client, message, magnet)
+        
+        elif text.startswith("/sub "):
+            query = text[5:].strip()
+            await self._add_subscription(client, message, query, False)
+        
+        elif text.startswith("/sub18 "):
+            query = text[7:].strip()
+            await self._add_subscription(client, message, query, True)
+        
+        elif text.startswith("/rmsub "):
+            query = text[7:].strip()
+            await self._remove_subscription(client, message, query, False)
+        
+        elif text.startswith("/rmsub18 "):
+            query = text[9:].strip()
+            await self._remove_subscription(client, message, query, True)
+        
+        elif text == "/misubs":
+            await self._list_subscriptions(client, message)
+    
+    async def _add_subscription(self, client: Client, message: Message, query: str, adult: bool):
+        status_msg = await message.reply(f"🔍 Configurando suscripción para: {query}...")
+        
+        try:
+            if adult:
+                results = self.nyaa.nyaafap(query)
+            else:
+                results = self.nyaa.nyaafun(query)
+            
+            if not results:
+                await status_msg.edit_text("❌ No se encontraron resultados para esta búsqueda.")
+                return
+            
+            first_result = results[0]
+            
+            sub_id = generate_cache_id()
+            
+            with subscription_lock:
+                subscriptions[sub_id] = {
+                    'chat_id': message.chat.id,
+                    'query': query,
+                    'adult': adult,
+                    'last_result': first_result,
+                    'created_at': time.time()
+                }
+            
+            text = f"✅ **Suscripción activada**\n\n"
+            text += f"**Término:** `{query}`\n"
+            text += f"**Modo:** {'+18' if adult else 'Normal'}\n\n"
+            text += f"**Último resultado guardado:**\n"
+            text += f"**{first_result['name']}**\n"
+            text += f"📦 {first_result['size']} | 📅 {first_result['date']}\n\n"
+            text += "El bot revisará cada minuto y descargará automáticamente nuevos resultados."
+            
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Cancelar suscripción", callback_data=f"sub_remove_{sub_id}")]
+            ])
+            
+            await status_msg.edit_text(text, reply_markup=keyboard)
+            
+        except Exception as e:
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
+    
+    async def _remove_subscription(self, client: Client, message: Message, query: str, adult: bool):
+        removed = False
+        with subscription_lock:
+            for sub_id, sub_data in list(subscriptions.items()):
+                if sub_data['chat_id'] == message.chat.id and sub_data['query'] == query and sub_data['adult'] == adult:
+                    del subscriptions[sub_id]
+                    removed = True
+                    break
+        
+        if removed:
+            await message.reply(f"✅ Suscripción eliminada para: `{query}`")
+        else:
+            await message.reply(f"❌ No se encontró suscripción para: `{query}`")
+    
+    async def _list_subscriptions(self, client: Client, message: Message):
+        user_subs = []
+        with subscription_lock:
+            for sub_id, sub_data in subscriptions.items():
+                if sub_data['chat_id'] == message.chat.id:
+                    user_subs.append((sub_id, sub_data))
+        
+        if not user_subs:
+            await message.reply("📭 No tienes suscripciones activas.")
+            return
+        
+        text = "**📋 Tus suscripciones:**\n\n"
+        for sub_id, sub_data in user_subs:
+            text += f"**Término:** `{sub_data['query']}`\n"
+            text += f"**Modo:** {'+18' if sub_data['adult'] else 'Normal'}\n"
+            text += f"**Último:** {sub_data['last_result']['name'][:50]}...\n"
+            text += f"**Fecha:** {sub_data['last_result']['date']}\n"
+            text += f"ID: `{sub_id}`\n\n"
+        
+        await message.reply(text)
+    
+    async def _send_subscription_notification(self, chat_id, text, download_link):
+        try:
+            msg = await self.app.send_message(chat_id, text)
+            await self._download_torrent(self.app, msg, download_link)
+        except Exception as e:
+            print(f"Error sending notification: {e}")
     
     async def _search_nyaa(self, client: Client, message: Message, query: str, adult: bool):
         status_msg = await message.reply(f"🔍 Buscando: {query}...")
@@ -177,7 +345,6 @@ class NekoTelegram:
                 return
             
             cache_id = generate_cache_id()
-            # Guardar resultados sin expiración
             search_cache[cache_id] = results
             
             await self._show_results_page(status_msg, cache_id, 1)
@@ -197,14 +364,12 @@ class NekoTelegram:
         start_idx = (page - 1) * 5
         end_idx = min(start_idx + 5, len(results))
         
-        # Construir texto con los resultados de esta página
         text = f"**Resultados (Página {page}/{total_pages})**\n\n"
         for i in range(start_idx, end_idx):
             result = results[i]
             text += f"**{i+1}.** {result['name'][:100]}\n"
             text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
         
-        # Crear botones para cada resultado
         keyboard = []
         for i in range(start_idx, end_idx):
             keyboard.append([InlineKeyboardButton(
@@ -212,7 +377,6 @@ class NekoTelegram:
                 callback_data=f"nyaa_detail_{cache_id}_{i}"
             )])
         
-        # Botones de navegación
         nav_row = []
         if page > 1:
             nav_row.append(InlineKeyboardButton("⬅️ Anterior", callback_data=f"nyaa_page_{cache_id}_{page-1}"))
@@ -285,8 +449,18 @@ class NekoTelegram:
             await callback_query.answer()
             return
         
+        if data.startswith("sub_remove_"):
+            sub_id = data[11:]
+            with subscription_lock:
+                if sub_id in subscriptions:
+                    del subscriptions[sub_id]
+                    await callback_query.message.edit_text("✅ Suscripción cancelada.")
+                else:
+                    await callback_query.answer("❌ Suscripción no encontrada")
+            await callback_query.answer()
+            return
+        
         if data.startswith("nyaa_page_"):
-            # Formato: nyaa_page_{cache_id}_{page}
             parts = data.split("_")
             cache_id = parts[2]
             page = int(parts[3])
@@ -295,7 +469,6 @@ class NekoTelegram:
             await callback_query.answer()
             
         elif data.startswith("nyaa_detail_"):
-            # Formato: nyaa_detail_{cache_id}_{index}
             parts = data.split("_")
             cache_id = parts[2]
             index = int(parts[3])
@@ -307,12 +480,10 @@ class NekoTelegram:
             
             result = results[index]
             
-            # Mostrar detalles del resultado seleccionado
             text = f"**{result['name']}**\n\n"
             text += f"📦 **Tamaño:** {result['size']}\n"
             text += f"📅 **Fecha:** {result['date']}\n\n"
             
-            # Botones para descargar
             keyboard = []
             
             if result.get('magnet'):
@@ -327,7 +498,6 @@ class NekoTelegram:
             await callback_query.answer()
             
         elif data.startswith("nyaa_dl_magnet_"):
-            # Formato: nyaa_dl_magnet_{cache_id}_{index}
             parts = data.split("_")
             cache_id = parts[3]
             index = int(parts[4])
@@ -345,7 +515,6 @@ class NekoTelegram:
                 await callback_query.answer("❌ No hay magnet disponible", show_alert=True)
                 
         elif data.startswith("nyaa_dl_torrent_"):
-            # Formato: nyaa_dl_torrent_{cache_id}_{index}
             parts = data.split("_")
             cache_id = parts[3]
             index = int(parts[4])
@@ -369,7 +538,13 @@ class NekoTelegram:
         self.flask_thread = threading.Thread(target=run_flask, daemon=True)
         self.flask_thread.start()
     
+    def start_subscription_checker(self):
+        schedule.every(1).minutes.do(check_subscriptions)
+        self.subscription_thread = threading.Thread(target=subscription_worker, daemon=True)
+        self.subscription_thread.start()
+    
     def run(self):
+        self.start_subscription_checker()
         self.app.run()
 
 def main():
