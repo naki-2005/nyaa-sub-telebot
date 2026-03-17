@@ -52,9 +52,7 @@ class TorrentDownloader:
     def add_torrent(self, ses, magnet_uri, save_path):
         params = {
             'save_path': save_path,
-            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
-            'auto_managed': True,
-            'duplicate_is_error': True
+            'storage_mode': lt.storage_mode_t.storage_mode_sparse
         }
         
         if magnet_uri.startswith('magnet:'):
@@ -480,10 +478,11 @@ class NekoTelegram:
                 callback_data=f"nyaa_detail_{cache_id}_{i}"
             )])
         
-        keyboard.append([InlineKeyboardButton(
-            f"📥 DESCARGAR TODOS ({end_idx-start_idx})", 
-            callback_data=f"nyaa_dl_all_{cache_id}_{start_idx}_{end_idx}"
-        )])
+        if (end_idx - start_idx) > 1:
+            keyboard.append([InlineKeyboardButton(
+                f"📥 DESCARGAR TODOS ({end_idx-start_idx})", 
+                callback_data=f"nyaa_dl_all_{cache_id}_{start_idx}_{end_idx}"
+            )])
         
         nav_row = []
         if page > 1:
