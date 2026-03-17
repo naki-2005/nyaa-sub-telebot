@@ -191,24 +191,7 @@ class NekoTelegram:
             cache_id = generate_cache_id()
             search_cache[cache_id] = results[:20]
             
-            text = f"**Resultados para:** `{query}`\n\n"
-            for i, result in enumerate(results[:5], 1):
-                text += f"{i}. **{result['name'][:50]}**...\n"
-                text += f"📦 {result['size']} | 📅 {result['date']}\n\n"
-            
-            keyboard = []
-            for i, result in enumerate(results[:10], 1):
-                keyboard.append([InlineKeyboardButton(f"{i}. {result['name'][:30]}...", callback_data=f"nyaa_detail_{cache_id}_{i-1}")])
-            
-            if len(results) > 5:
-                total_pages = (len(results) + 4) // 5
-                keyboard.append([
-                    InlineKeyboardButton("⬅️ Anterior", callback_data=f"nyaa_page_{cache_id}_prev"),
-                    InlineKeyboardButton(f"1/{total_pages}", callback_data="noop"),
-                    InlineKeyboardButton("Siguiente ➡️", callback_data=f"nyaa_page_{cache_id}_next")
-                ])
-            
-            await status_msg.edit_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+            await self._show_results_page(status_msg, cache_id, 1)
             
         except Exception as e:
             await status_msg.edit_text(f"❌ Error: {str(e)}")
@@ -340,34 +323,8 @@ class NekoTelegram:
         if data.startswith("nyaa_page_"):
             parts = data.split("_")
             cache_id = parts[2]
-            
-            if parts[3] == "prev" or parts[3] == "next":
-                results = search_cache.get(cache_id, [])
-                if not results:
-                    await callback_query.answer("Resultados expirados")
-                    return
-                
-                current_text = callback_query.message.text
-                current_page = 1
-                
-                page_match = re.search(r'Página (\d+)/(\d+)', current_text)
-                if page_match:
-                    current_page = int(page_match.group(1))
-                    total_pages = int(page_match.group(2))
-                else:
-                    total_pages = (len(results) + 4) // 5
-                
-                if parts[3] == "next":
-                    new_page = current_page + 1
-                else:
-                    new_page = current_page - 1
-                
-                if 1 <= new_page <= total_pages:
-                    await self._show_results_page(callback_query.message, cache_id, new_page)
-            else:
-                page = int(parts[3])
-                await self._show_results_page(callback_query.message, cache_id, page)
-            
+            page = int(parts[3])
+            await self._show_results_page(callback_query.message, cache_id, page)
             await callback_query.answer()
             
         elif data.startswith("nyaa_detail_"):
