@@ -259,7 +259,7 @@ class NekoTelegram:
         self.nyaa = nyaa.Nyaa_search()
         self.flask_thread = None
         self.subscription_thread = None
-        self.notification_thread = None
+        self.notification_task = None
         self.running = True
         
         @self.app.on_message(filters.private)
@@ -713,6 +713,9 @@ class NekoTelegram:
         self.subscription_thread.start()
         print("Subscription checker started")
     
+    async def start_notification_processor(self):
+        self.notification_task = asyncio.create_task(self._process_notifications())
+    
     def run(self):
         self.running = True
         self.start_subscription_checker()
@@ -720,9 +723,10 @@ class NekoTelegram:
         if args.flask:
             self.start_flask()
         
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.create_task(self._process_notifications())
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.start_notification_processor())
+        
+        print("Bot iniciado. Esperando mensajes...")
         self.app.run()
 
 def main():
