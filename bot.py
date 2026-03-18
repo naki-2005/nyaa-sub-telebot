@@ -154,7 +154,12 @@ def check_subscriptions():
                 if results and len(results) > 0:
                     first_result = results[0]
                     
-                    if last_result is None or first_result['date'] != last_result['date']:
+                    if (last_result is None or 
+                        first_result['date'] != last_result['date'] or
+                        first_result['name'] != last_result['name']):
+                        
+                        print(f"🔔 Nuevo resultado para '{query}': {first_result['name']}")
+                        
                         sub_data['last_result'] = first_result
                         
                         if first_result.get('magnet'):
@@ -164,29 +169,28 @@ def check_subscriptions():
                         else:
                             continue
                         
-                        text = f"🆕 **Nuevo resultado encontrado para:** `{query}`\n\n"
-                        text += f"**{first_result['name']}**\n"
-                        text += f"📦 Tamaño: {first_result['size']}\n"
-                        text += f"📅 Fecha: {first_result['date']}\n\n"
-                        text += "Iniciando descarga automática..."
+                        text = f"🆕 **Nuevo resultado encontrado!**\n\n"
+                        text += f"**Término:** `{query}`\n"
+                        text += f"**Título:** {first_result['name'][:200]}\n"
+                        text += f"📦 **Tamaño:** {first_result['size']}\n"
+                        text += f"📅 **Fecha:** {first_result['date']}\n\n"
+                        text += "⏳ Iniciando descarga automática..."
                         
-                        class TempMessage:
-                            def __init__(self, chat_id):
-                                self.chat = type('obj', (object,), {'id': chat_id})
-                                self.text = ""
-                        
-                        temp_msg = TempMessage(chat_id)
-                        
-                        bot = None
+                        bot_instance = None
                         for thread in threading.enumerate():
-                            if hasattr(thread, '_target') and thread._target and 'run_bot' in str(thread._target):
-                                bot = getattr(thread, 'bot_instance', None)
-                                break
+                            if hasattr(thread, '_target') and 'run_bot' in str(thread._target):
+                                for attr_name in dir(thread):
+                                    attr = getattr(thread, attr_name)
+                                    if isinstance(attr, NekoTelegram):
+                                        bot_instance = attr
+                                        break
+                                if bot_instance:
+                                    break
                         
-                        if bot:
+                        if bot_instance:
                             asyncio.run_coroutine_threadsafe(
-                                bot._send_subscription_notification(chat_id, text, download_link),
-                                bot.app.loop
+                                bot_instance._send_subscription_notification(chat_id, text, download_link),
+                                bot_instance.app.loop
                             )
                             
             except Exception as e:
@@ -201,6 +205,7 @@ class NekoTelegram:
         self.nyaa = nyaa.Nyaa_search()
         self.flask_thread = None
         self.subscription_thread = None
+        self._instance = self
         
         @self.app.on_message(filters.private)
         async def handle_message(client: Client, message: Message):
@@ -330,10 +335,23 @@ class NekoTelegram:
     
     async def _send_subscription_notification(self, chat_id, text, download_link):
         try:
-            msg = await self.app.send_message(chat_id, text)
+            msg = await self.app.send_message(
+                chat_id, 
+                text,
+                parse_mode=ParseMode.MARKDOWN
+            )
+            
             await self._download_torrent(self.app, msg, download_link)
+            
         except Exception as e:
-            print(f"Error sending notification: {e}")
+            print(f"Error en notificación de suscripción: {e}")
+            try:
+                await self.app.send_message(
+                    chat_id,
+                    f"❌ Error al procesar la suscripción: {str(e)[:100]}"
+                )
+            except:
+                pass
     
     async def _search_nyaa(self, client: Client, message: Message, query: str, adult: bool):
         status_msg = await message.reply(f"🔍 Buscando: {query}...")
